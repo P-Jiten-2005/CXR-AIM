@@ -1018,17 +1018,70 @@ async def update_shot(shot_id: str, update_in: schemas.ShotUpdate, db: AsyncSess
     shot = result.scalars().first()
     if not shot:
         raise HTTPException(status_code=404, detail="Shot not found")
-    if update_in.is_valid is not None:
-        shot.is_valid = update_in.is_valid
-    if update_in.boundary_status is not None:
+
+    is_approved = (
+        update_in.boundary_status is not None
+        and update_in.boundary_status != "review_required"
+        and update_in.is_valid is not False
+    )
+    is_excluded = update_in.is_valid is False
+
+    if is_approved:
+        if shot.verdict in ["REVIEW", "CONFLICT"]:
+            result_session = await db.execute(
+                select(models.Session).where(models.Session.id == shot.session_id)
+            )
+            session = result_session.scalars().first()
+            if session:
+                apply_scoring_to_shot(shot, session)
+            shot.is_valid = True
+        else:
+            if update_in.is_valid is not None:
+                shot.is_valid = update_in.is_valid
+
         shot.boundary_status = update_in.boundary_status
+
+        # Query and update associated VerificationAudit
+        audit_res = await db.execute(
+            select(models.VerificationAudit).where(models.VerificationAudit.shot_id == shot.id)
+        )
+        audit = audit_res.scalars().first()
+        if audit:
+            audit.adjudication_decision = "ACCEPTED"
+            audit.adjudicated_by = "operator"
+            audit.adjudicated_at = datetime.utcnow()
+
+    elif is_excluded:
+        shot.is_valid = False
+        if update_in.boundary_status is not None:
+            shot.boundary_status = update_in.boundary_status
+
+        # Query and update associated VerificationAudit
+        audit_res = await db.execute(
+            select(models.VerificationAudit).where(models.VerificationAudit.shot_id == shot.id)
+        )
+        audit = audit_res.scalars().first()
+        if audit:
+            audit.adjudication_decision = "REJECTED"
+            audit.adjudicated_by = "operator"
+            audit.adjudicated_at = datetime.utcnow()
+
+    else:
+        # Standard PATCH updates
+        if update_in.is_valid is not None:
+            shot.is_valid = update_in.is_valid
+        if update_in.boundary_status is not None:
+            shot.boundary_status = update_in.boundary_status
+
     await db.commit()
     await db.refresh(shot)
+
+    shot_response = build_shot_response(shot, shot.detection)
     await ws_manager.broadcast_to_session(shot.session_id, {
         "event": "SHOT_UPDATED",
-        "data": {"shot_id": shot.id, "is_valid": shot.is_valid, "boundary_status": shot.boundary_status},
+        "data": shot_response.dict(),
     })
-    return build_shot_response(shot, shot.detection)
+    return shot_response
 
 
 # --- Camera endpoint aliases (compat for the role-based dashboard UI) ---
