@@ -990,6 +990,119 @@ async def set_ai_verifier_config(enabled: bool = True):
     return {"success": True, "enabled": ai_verifier.enabled}
 
 
+@app.get(f"{settings.API_V1_STR}/lanes/{{lane}}/config", response_model=schemas.LaneConfigResponse)
+async def get_lane_config(lane: int, db: AsyncSession = Depends(get_db)):
+    """Retrieves the configuration for a specific lane, falling back to global default config, or in-memory default."""
+    config = await resolve_lane_config(db, lane)
+    from app.models.models import generate_uuid
+    res_id = config.id or generate_uuid()
+    res_created_at = config.created_at or datetime.utcnow()
+    res_updated_at = config.updated_at or datetime.utcnow()
+    res_lane = config.lane if config.lane is not None else lane
+    return schemas.LaneConfigResponse(
+        id=res_id,
+        lane=res_lane,
+        geom_area_strict_min=config.geom_area_strict_min,
+        geom_area_strict_max=config.geom_area_strict_max,
+        geom_area_loose_min=config.geom_area_loose_min,
+        geom_area_loose_max=config.geom_area_loose_max,
+        geom_circ_strict=config.geom_circ_strict,
+        geom_circ_loose=config.geom_circ_loose,
+        geom_aspect_strict_min=config.geom_aspect_strict_min,
+        geom_aspect_strict_max=config.geom_aspect_strict_max,
+        geom_aspect_loose_min=config.geom_aspect_loose_min,
+        geom_aspect_loose_max=config.geom_aspect_loose_max,
+        duplicate_radius_px=config.duplicate_radius_px,
+        duplicate_time_window_sec=config.duplicate_time_window_sec,
+        localization_spread_threshold=config.localization_spread_threshold,
+        yolo_conf_strict=config.yolo_conf_strict,
+        yolo_conf_loose=config.yolo_conf_loose,
+        weight_geometry=config.weight_geometry,
+        weight_yolo=config.weight_yolo,
+        weight_localization=config.weight_localization,
+        threshold_verified=config.threshold_verified,
+        created_at=res_created_at,
+        updated_at=res_updated_at
+    )
+
+
+@app.post(f"{settings.API_V1_STR}/lanes/{{lane}}/config", response_model=schemas.LaneConfigResponse)
+async def create_or_update_lane_config(
+    lane: int,
+    config_in: schemas.LaneConfigCreate,
+    db: AsyncSession = Depends(get_db)
+):
+    """Creates or updates configuration parameters for a specific lane."""
+    result = await db.execute(
+        select(models.LaneConfig).where(models.LaneConfig.lane == lane)
+    )
+    db_config = result.scalars().first()
+    
+    if db_config:
+        update_data = config_in.model_dump(exclude_unset=True)
+        update_data["lane"] = lane
+        for key, value in update_data.items():
+            setattr(db_config, key, value)
+        db_config.updated_at = datetime.utcnow()
+    else:
+        config_data = config_in.model_dump()
+        config_data["lane"] = lane
+        db_config = models.LaneConfig(**config_data)
+        db.add(db_config)
+        
+    await db.commit()
+    await db.refresh(db_config)
+    return db_config
+
+
+@app.delete(f"{settings.API_V1_STR}/lanes/{{lane}}/config")
+async def delete_lane_config(lane: int, db: AsyncSession = Depends(get_db)):
+    """Deletes the configuration for a specific lane, causing it to fall back to global default configuration."""
+    result = await db.execute(
+        select(models.LaneConfig).where(models.LaneConfig.lane == lane)
+    )
+    db_config = result.scalars().first()
+    if not db_config:
+        raise HTTPException(status_code=404, detail=f"Configuration for lane {lane} not found")
+        
+    await db.delete(db_config)
+    await db.commit()
+    return {"success": True, "detail": f"Configuration for lane {lane} deleted"}
+
+
+@app.get(f"{settings.API_V1_STR}/verification/audit", response_model=List[schemas.VerificationAuditResponse])
+async def get_verification_audits(
+    lane_id: Optional[int] = Query(None),
+    verdict: Optional[str] = Query(None),
+    start_time: Optional[datetime] = Query(None),
+    end_time: Optional[datetime] = Query(None),
+    db: AsyncSession = Depends(get_db)
+):
+    """Retrieves list of verification audits with optional filtering."""
+    query = select(models.VerificationAudit)
+    if lane_id is not None:
+        query = query.where(models.VerificationAudit.lane_id == lane_id)
+    if verdict is not None:
+        query = query.where(models.VerificationAudit.verdict == verdict)
+    
+    if start_time is not None:
+        if start_time.tzinfo is not None:
+            from datetime import timezone
+            start_time = start_time.astimezone(timezone.utc).replace(tzinfo=None)
+        query = query.where(models.VerificationAudit.timestamp >= start_time)
+        
+    if end_time is not None:
+        if end_time.tzinfo is not None:
+            from datetime import timezone
+            end_time = end_time.astimezone(timezone.utc).replace(tzinfo=None)
+        query = query.where(models.VerificationAudit.timestamp <= end_time)
+        
+    query = query.order_by(models.VerificationAudit.timestamp.desc())
+    result = await db.execute(query)
+    audits = result.scalars().all()
+    return audits
+
+
 @app.get("/shots/review", response_model=List[schemas.ShotResponse])
 @app.get(f"{settings.API_V1_STR}/shots/review")
 async def get_shots_for_review(db: AsyncSession = Depends(get_db)):
