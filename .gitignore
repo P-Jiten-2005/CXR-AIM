@@ -1,0 +1,54 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Databases
+backend/data/*.db
+backend/data/*.sqlite
+*.db
+*.sqlite
+
+# Uploads and temporary media
+backend/uploads/
+uploads/
+*.jpg
+*.jpeg
+*.png
+*.gif
+
+# YOLO weights & training outputs
+*.pt
+runs/
+dataset/
+datasets/
+
+# Node/Frontend dependencies and build artifacts
+node_modules/
+.next/
+dist/
+build/
+out/
+.pnpm-store/
+
+# IDE and tool configs
+.claude/
+.gemini/
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+
+# OS generated files
+.DS_Store
+Thumbs.db
