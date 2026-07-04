@@ -530,15 +530,15 @@ async def run_detection(
     db.add(capture_image)
     await db.flush() # Generate ID for capture_image
 
-    # 3. Resolve LaneConfig and query verified existing shots
+    # 3. Resolve LaneConfig and query all existing shots in the session for duplicate prevention
     lane_config = await resolve_lane_config(db, lane)
     shots_result = await db.execute(
-        select(models.Shot).where(models.Shot.session_id == session_id).where(models.Shot.verdict == "VERIFIED")
+        select(models.Shot).where(models.Shot.session_id == session_id)
     )
-    verified_shots = shots_result.scalars().all()
+    session_shots = shots_result.scalars().all()
     existing_shots = [
         {"x_raw": s.x_raw, "y_raw": s.y_raw, "diameter_px": s.diameter_px} 
-        for s in verified_shots
+        for s in session_shots
     ]
 
     # 4. Count current shots to establish shot numbering sequence
@@ -560,7 +560,7 @@ async def run_detection(
     for detection in new_hole_detections:
         verdict, score, explanation, signals = ConfidenceEngine.evaluate_candidate(
             candidate=detection,
-            session_shots=verified_shots,
+            session_shots=session_shots,
             lane_config=lane_config,
             img=aligned_img
         )
@@ -1431,15 +1431,15 @@ async def capture_after_fire(
     db.add(capture_image)
     await db.flush()
 
-    # 3. Resolve LaneConfig and query verified existing shots
+    # 3. Resolve LaneConfig and query all existing shots in the session for duplicate prevention
     lane_config = await resolve_lane_config(db, lane)
     shots_result = await db.execute(
-        select(models.Shot).where(models.Shot.session_id == session_id).where(models.Shot.verdict == "VERIFIED")
+        select(models.Shot).where(models.Shot.session_id == session_id)
     )
-    verified_shots = shots_result.scalars().all()
+    session_shots = shots_result.scalars().all()
     existing_shots = [
         {"x_raw": s.x_raw, "y_raw": s.y_raw, "diameter_px": s.diameter_px}
-        for s in verified_shots
+        for s in session_shots
     ]
 
     # Get current sequence count
@@ -1471,7 +1471,7 @@ async def capture_after_fire(
     for detection in new_hole_detections:
         verdict, score, explanation, signals = ConfidenceEngine.evaluate_candidate(
             candidate=detection,
-            session_shots=verified_shots,
+            session_shots=session_shots,
             lane_config=lane_config,
             img=aligned_img
         )
@@ -1646,15 +1646,15 @@ async def run_detect(
         filename = os.path.basename(current_path)
         current_path = os.path.join(settings.UPLOAD_DIR, filename)
 
-    # 3. Resolve LaneConfig and query verified existing shots
+    # 3. Resolve LaneConfig and query all existing shots in the session for duplicate prevention
     lane_config = await resolve_lane_config(db, lane)
     shots_res = await db.execute(
-        select(models.Shot).where(models.Shot.session_id == session_id).where(models.Shot.verdict == "VERIFIED")
+        select(models.Shot).where(models.Shot.session_id == session_id)
     )
-    verified_shots = shots_res.scalars().all()
+    session_shots = shots_res.scalars().all()
     existing_shots = [
         {"x_raw": s.x_raw, "y_raw": s.y_raw, "diameter_px": s.diameter_px}
-        for s in verified_shots
+        for s in session_shots
     ]
 
     # Get sequence count
@@ -1691,7 +1691,7 @@ async def run_detect(
     for hole in new_holes:
         verdict, score, explanation, signals = ConfidenceEngine.evaluate_candidate(
             candidate=hole,
-            session_shots=verified_shots,
+            session_shots=session_shots,
             lane_config=lane_config,
             img=aligned_img
         )

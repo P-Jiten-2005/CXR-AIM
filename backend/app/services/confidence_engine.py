@@ -202,7 +202,7 @@ class ConfidenceEngine:
 
             # 3. YOLO check
             # Run YOLO crop logic
-            is_verified, yolo_conf, _ = ai_verifier.verify_candidate_roi(
+            is_verified, yolo_conf, class_name = ai_verifier.verify_candidate_roi(
                 color_img,
                 candidate["x_raw"],
                 candidate["y_raw"],
@@ -228,42 +228,59 @@ class ConfidenceEngine:
                 raise TimeoutError("Execution timed out after localization check.")
 
             # 5. Active Disagreement (CONFLICT)
+            is_yolo_active = class_name not in ("opencv_fallback", "verifier_bypassed")
             is_yolo_strong = yolo_conf >= lane_config.yolo_conf_strict
             is_yolo_fail = yolo_conf < lane_config.yolo_conf_loose
             is_geom_fail = geom_status == "fail"
             is_loc_fail = loc_status == "fail"
 
-            if is_yolo_strong and (is_geom_fail and is_loc_fail):
-                spread_val = loc_info.get("spread", -1.0)
-                spread_str = f"{spread_val:.1f}px" if spread_val >= 0 else "unknown"
-                return (
-                    "CONFLICT",
-                    0.50,
-                    f"Active Disagreement: YOLO strongly verified hole (conf={yolo_conf:.2f}), but CV geometry and localization consensus failed (spread={spread_str}).",
-                    {"geometry": geom_status, "yolo": yolo_conf, "localization": loc_status}
-                )
-            if (geom_status == "strong_pass" and loc_status == "strong_pass") and is_yolo_fail:
-                return (
-                    "CONFLICT",
-                    0.50,
-                    f"Active Disagreement: CV shape and localization are perfect, but YOLO failed to detect a hole (conf={yolo_conf:.2f}).",
-                    {"geometry": geom_status, "yolo": yolo_conf, "localization": loc_status}
-                )
+            if is_yolo_active:
+                if is_yolo_strong and (is_geom_fail and is_loc_fail):
+                    spread_val = loc_info.get("spread", -1.0)
+                    spread_str = f"{spread_val:.1f}px" if spread_val >= 0 else "unknown"
+                    return (
+                        "CONFLICT",
+                        0.50,
+                        f"Active Disagreement: YOLO strongly verified hole (conf={yolo_conf:.2f}), but CV geometry and localization consensus failed (spread={spread_str}).",
+                        {"geometry": geom_status, "yolo": yolo_conf, "localization": loc_status}
+                    )
+                if (geom_status == "strong_pass" and loc_status == "strong_pass") and is_yolo_fail:
+                    return (
+                        "CONFLICT",
+                        0.50,
+                        f"Active Disagreement: CV shape and localization are perfect, but YOLO failed to detect a hole (conf={yolo_conf:.2f}).",
+                        {"geometry": geom_status, "yolo": yolo_conf, "localization": loc_status}
+                    )
 
             # 6. Weighted sum
-            w_sum = lane_config.weight_geometry + lane_config.weight_yolo + lane_config.weight_localization
-            if w_sum <= 0:
-                w_g, w_y, w_l = 0.40, 0.40, 0.20
+            if not is_yolo_active:
+                w_sum = lane_config.weight_geometry + lane_config.weight_localization
+                if w_sum <= 0:
+                    w_g, w_l = 0.67, 0.33
+                else:
+                    w_g = lane_config.weight_geometry / w_sum
+                    w_l = lane_config.weight_localization / w_sum
+                w_y = 0.0
+                s_yolo = 0.0
             else:
-                w_g = lane_config.weight_geometry / w_sum
-                w_y = lane_config.weight_yolo / w_sum
-                w_l = lane_config.weight_localization / w_sum
+                w_sum = lane_config.weight_geometry + lane_config.weight_yolo + lane_config.weight_localization
+                if w_sum <= 0:
+                    w_g, w_y, w_l = 0.40, 0.40, 0.20
+                else:
+                    w_g = lane_config.weight_geometry / w_sum
+                    w_y = lane_config.weight_yolo / w_sum
+                    w_l = lane_config.weight_localization / w_sum
 
-            raw_score = (w_g * s_geom) + (w_y * s_yolo) + (w_l * s_loc)
-            if loc_status == "fail":
-                raw_score -= 0.15
-            if s_yolo == 0.0:
-                raw_score -= 0.10
+            if not is_yolo_active:
+                raw_score = (w_g * s_geom) + (w_l * s_loc)
+                if loc_status == "fail":
+                    raw_score -= 0.15
+            else:
+                raw_score = (w_g * s_geom) + (w_y * s_yolo) + (w_l * s_loc)
+                if loc_status == "fail":
+                    raw_score -= 0.15
+                if s_yolo == 0.0:
+                    raw_score -= 0.10
 
             fused_score = min(max(raw_score, 0.0), 1.0)
             verdict = "VERIFIED" if fused_score >= lane_config.threshold_verified else "REVIEW"
