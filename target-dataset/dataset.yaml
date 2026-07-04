@@ -1,0 +1,8 @@
+path: D:\CXR_AIM\target-dataset
+train: images/train
+val: images/val
+test: images/test
+names:
+  0: bullet_hole
+  1: paper_tear
+  2: false_positive

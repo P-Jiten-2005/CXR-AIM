@@ -1,0 +1,45 @@
+{
+  "name": "test in real ",
+  "width_mm": 520,
+  "height_mm": 1145,
+  "bullet_compatibility": [
+    "5.56",
+    "7.62",
+    "9.0"
+  ],
+  "decimal_scoring_supported": true,
+  "ring_spacing_mm": 2.5,
+  "tag_size_mm": 47,
+  "tag_margin_mm": 20,
+  "bullseyes": [],
+  "scoring_regions": [
+    {
+      "id": 1,
+      "name": "Zone 1",
+      "value": 5,
+      "x_min_mm": 216.2,
+      "y_min_mm": 488,
+      "x_max_mm": 352.5,
+      "y_max_mm": 657
+    },
+    {
+      "id": 2,
+      "name": "Zone 2",
+      "value": 4,
+      "x_min_mm": 178,
+      "y_min_mm": 441.6,
+      "x_max_mm": 382.5,
+      "y_max_mm": 695.2
+    },
+    {
+      "id": 3,
+      "name": "Zone 3",
+      "value": 3,
+      "x_min_mm": 153.5,
+      "y_min_mm": 406.2,
+      "x_max_mm": 401.6,
+      "y_max_mm": 744.3
+    }
+  ],
+  "preview_url": "/static/uploads/target_preview_test_in_real_.png"
+}
