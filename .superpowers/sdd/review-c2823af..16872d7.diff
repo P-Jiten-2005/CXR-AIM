@@ -1,0 +1,578 @@
+# Review package: c2823af..16872d7
+
+## Commits
+16872d7 feat: implement V&CE verifiers and ConfidenceEngine fusion layer
+
+## Files changed
+ backend/app/services/confidence_engine.py | 286 ++++++++++++++++++++++++++++++
+ backend/tests/test_confidence_engine.py   | 269 ++++++++++++++++++++++++++++
+ 2 files changed, 555 insertions(+)
+
+## Diff
+diff --git a/backend/app/services/confidence_engine.py b/backend/app/services/confidence_engine.py
+new file mode 100644
+index 0000000..c06df04
+--- /dev/null
++++ b/backend/app/services/confidence_engine.py
+@@ -0,0 +1,286 @@
++import numpy as np
++import cv2
++import logging
++import time
++import concurrent.futures
++from typing import Tuple, Dict, Any, List, Optional
++from datetime import datetime
++from app.services.ai_verifier import ai_verifier
++
++logger = logging.getLogger("app.confidence_engine")
++_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
++
++class GeometryVerifier:
++    @staticmethod
++    def evaluate(area: float, circularity: float, solidity: float, aspect_ratio: float, config: Any) -> Tuple[str, float]:
++        is_area_out = not (config.geom_area_loose_min <= area <= config.geom_area_loose_max)
++        if is_area_out:
++            return "fail", 0.0
++
++        scores = []
++        # Circularity (discrete contours can exceed 1.0)
++        if circularity >= config.geom_circ_strict:
++            scores.append(1.0)
++        elif config.geom_circ_loose <= circularity < config.geom_circ_strict:
++            scores.append(0.5)
++        else:
++            scores.append(0.0)
++
++        # Solidity
++        if solidity >= 0.80:  # strict
++            scores.append(1.0)
++        elif 0.65 <= solidity < 0.80:  # loose
++            scores.append(0.5)
++        else:
++            scores.append(0.0)
++
++        # Aspect Ratio
++        if config.geom_aspect_strict_min <= aspect_ratio <= config.geom_aspect_strict_max:
++            scores.append(1.0)
++        elif config.geom_aspect_loose_min <= aspect_ratio <= config.geom_aspect_loose_max:
++            scores.append(0.5)
++        else:
++            scores.append(0.0)
++
++        geom_score = float(np.mean(scores))
++        is_fail = any(s == 0.0 for s in scores)
++        
++        if is_fail:
++            return "fail", geom_score
++        elif all(s == 1.0 for s in scores):
++            return "strong_pass", geom_score
++        else:
++            return "weak_pass", geom_score
++
++class DuplicateVerifier:
++    @staticmethod
++    def evaluate(cX: float, cY: float, timestamp: float, verified_shots: List[Any], config: Any) -> Tuple[str, Dict[str, Any]]:
++        for s in verified_shots:
++            is_dict = isinstance(s, dict)
++            x_val = s["x_raw"] if is_dict else s.x_raw
++            y_val = s["y_raw"] if is_dict else s.y_raw
++            shot_num = s["shot_number"] if is_dict else s.shot_number
++            shot_id = s.get("id") if is_dict else getattr(s, "id", None)
++            
++            created_at = s.get("created_at") if is_dict else s.created_at
++            if created_at is not None:
++                if hasattr(created_at, "timestamp"):
++                    s_ts = created_at.timestamp()
++                elif isinstance(created_at, (int, float)):
++                    s_ts = float(created_at)
++                elif isinstance(created_at, str):
++                    try:
++                        s_ts = datetime.fromisoformat(created_at.replace("Z", "+00:00")).timestamp()
++                    except Exception:
++                        s_ts = timestamp
++                else:
++                    s_ts = timestamp
++            else:
++                created_at_ts = s.get("created_at_ts") if is_dict else getattr(s, "created_at_ts", None)
++                if created_at_ts is not None:
++                    s_ts = float(created_at_ts)
++                else:
++                    s_ts = timestamp
++
++            dist = np.sqrt((cX - x_val)**2 + (cY - y_val)**2)
++            t_diff = abs(timestamp - s_ts)
++            if dist <= config.duplicate_radius_px and t_diff <= config.duplicate_time_window_sec:
++                return "duplicate", {"matched_shot_number": shot_num, "dist": dist, "shot_id": shot_id}
++        return "neutral", {}
++
++class LocalizationVerifier:
++    @staticmethod
++    def evaluate(c_data: Any, gray_img: np.ndarray, config: Any) -> Tuple[str, float, Dict[str, Any]]:
++        c = np.array(c_data, dtype=np.int32)
++        if c.size == 0 or len(c) == 0:
++            raise ValueError("empty contour")
++        
++        # 1. Moment based centroid
++        M = cv2.moments(c)
++        if M["m00"] == 0:
++            raise ValueError("zero moments")
++        cX_m = M["m10"] / M["m00"]
++        cY_m = M["m01"] / M["m00"]
++
++        # 2. Intensity-weighted centroid
++        x, y, w, h = cv2.boundingRect(c)
++        img_h, img_w = gray_img.shape
++        x_start = max(0, x)
++        y_start = max(0, y)
++        x_end = min(img_w, x + w)
++        y_end = min(img_h, y + h)
++        
++        roi = gray_img[y_start:y_end, x_start:x_end]
++        if roi.size == 0:
++            raise ValueError("empty ROI bounding box")
++        y_indices, x_indices = np.indices(roi.shape)
++        weights = 255.0 - roi.astype(np.float32)  # Darker pixels are bullet hole interiors -> higher weight
++        total_w = weights.sum()
++        if total_w > 0:
++            cX_w = x_start + (x_indices * weights).sum() / total_w
++            cY_w = y_start + (y_indices * weights).sum() / total_w
++        else:
++            cX_w, cY_w = cX_m, cY_m
++
++        # 3. Ellipse fit
++        if len(c) >= 5:
++            try:
++                ellipse = cv2.fitEllipse(c)
++                cX_e, cY_e = ellipse[0]
++            except Exception:
++                cX_e, cY_e = cX_m, cY_m
++        else:
++            cX_e, cY_e = cX_m, cY_m
++
++        # 4. Intensity peak center
++        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(roi)
++        cX_p = x_start + min_loc[0]
++        cY_p = y_start + min_loc[1]
++
++        estimators = np.array([[cX_m, cY_m], [cX_w, cY_w], [cX_e, cY_e], [cX_p, cY_p]])
++        dists = []
++        for i in range(4):
++            for j in range(i+1, 4):
++                dists.append(np.linalg.norm(estimators[i] - estimators[j]))
++        max_spread = float(np.max(dists))
++
++        status = "strong_pass" if max_spread <= config.localization_spread_threshold else "fail"
++        score = 1.0 if status == "strong_pass" else 0.2
++        return status, score, {"spread": max_spread, "estimators": estimators.tolist()}
++
++class ConfidenceEngine:
++    @staticmethod
++    def evaluate_candidate(
++        candidate: Dict[str, Any],
++        session_shots: List[Any],
++        lane_config: Any,
++        img: np.ndarray,
++        timestamp: Optional[float] = None
++    ) -> Tuple[str, float, str, Dict[str, Any]]:
++        # Current time in unix float timestamp
++        if timestamp is None:
++            timestamp = time.time()
++
++        def _run_internal():
++            # Resolve gray and color versions of the image crop
++            if len(img.shape) == 2:
++                gray_img = img
++                color_img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
++            else:
++                gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
++                color_img = img
++
++            # 1. Duplicate check
++            dup_status, dup_info = DuplicateVerifier.evaluate(
++                candidate["x_raw"], candidate["y_raw"], timestamp, session_shots, lane_config
++            )
++            if dup_status == "duplicate":
++                return (
++                    "REJECTED",
++                    0.0,
++                    f"DuplicateVerifier: Candidate matches existing Shot #{dup_info['matched_shot_number']} within {dup_info['dist']:.1f}px.",
++                    {"duplicate": dup_status}
++                )
++
++            # 2. Geometry check
++            geom_status, s_geom = GeometryVerifier.evaluate(
++                candidate["area"], candidate["circularity"], candidate["solidity"], candidate["aspect_ratio"], lane_config
++            )
++            if geom_status == "fail" and s_geom <= 0.15:
++                return (
++                    "REJECTED",
++                    0.0,
++                    f"GeometryVerifier: Extreme geometry failure (area={candidate['area']:.1f}, circularity={candidate['circularity']:.2f}, aspect_ratio={candidate['aspect_ratio']:.2f}).",
++                    {"geometry": geom_status}
++                )
++
++            # 3. YOLO check
++            # Run YOLO crop logic
++            is_verified, yolo_conf, _ = ai_verifier.verify_candidate_roi(
++                color_img,
++                candidate["x_raw"],
++                candidate["y_raw"],
++                candidate["diameter_px"],
++                circularity=candidate["circularity"],
++                solidity=candidate["solidity"],
++                aspect_ratio=candidate["aspect_ratio"]
++            )
++            s_yolo = 1.0 if yolo_conf >= lane_config.yolo_conf_strict else (0.5 if yolo_conf >= lane_config.yolo_conf_loose else 0.0)
++
++            # 4. Localization check
++            contour_data = candidate.get("raw_contour_np")
++            if contour_data is None:
++                contour_data = candidate.get("raw_contour")
++            if contour_data is None:
++                raise ValueError("Candidate is missing contour data ('raw_contour_np' or 'raw_contour')")
++            loc_status, s_loc, loc_info = LocalizationVerifier.evaluate(contour_data, gray_img, lane_config)
++
++            # 5. Active Disagreement (CONFLICT)
++            is_yolo_strong = yolo_conf >= lane_config.yolo_conf_strict
++            is_yolo_fail = yolo_conf < lane_config.yolo_conf_loose
++            is_geom_fail = geom_status == "fail"
++            is_loc_fail = loc_status == "fail"
++
++            if is_yolo_strong and (is_geom_fail and is_loc_fail):
++                spread_val = loc_info.get("spread", -1.0)
++                spread_str = f"{spread_val:.1f}px" if spread_val >= 0 else "unknown"
++                return (
++                    "CONFLICT",
++                    0.50,
++                    f"Active Disagreement: YOLO strongly verified hole (conf={yolo_conf:.2f}), but CV geometry and localization consensus failed (spread={spread_str}).",
++                    {"geometry": geom_status, "yolo": yolo_conf, "localization": loc_status}
++                )
++            if (geom_status == "strong_pass" and loc_status == "strong_pass") and is_yolo_fail:
++                return (
++                    "CONFLICT",
++                    0.50,
++                    f"Active Disagreement: CV shape and localization are perfect, but YOLO failed to detect a hole (conf={yolo_conf:.2f}).",
++                    {"geometry": geom_status, "yolo": yolo_conf, "localization": loc_status}
++                )
++
++            # 6. Weighted sum
++            w_sum = lane_config.weight_geometry + lane_config.weight_yolo + lane_config.weight_localization
++            w_g = lane_config.weight_geometry / w_sum
++            w_y = lane_config.weight_yolo / w_sum
++            w_l = lane_config.weight_localization / w_sum
++
++            raw_score = (w_g * s_geom) + (w_y * s_yolo) + (w_l * s_loc)
++            if loc_status == "fail":
++                raw_score -= 0.15
++            if s_yolo == 0.0:
++                raw_score -= 0.10
++
++            fused_score = min(max(raw_score, 0.0), 1.0)
++            verdict = "VERIFIED" if fused_score >= lane_config.threshold_verified else "REVIEW"
++            explanation = (
++                f"Verification score {fused_score:.2f} meets threshold."
++                if verdict == "VERIFIED"
++                else f"Failed threshold_verified {lane_config.threshold_verified:.2f}. Low scoring modules: geom={s_geom:.2f}, yolo={yolo_conf:.2f}, loc={s_loc:.2f}"
++            )
++            return (
++                verdict,
++                fused_score,
++                explanation,
++                {"geometry": geom_status, "yolo": yolo_conf, "localization": loc_status, "spread": loc_info.get("spread")}
++            )
++
++        # Run pipeline with thread executor to implement failsafe timeout (e.g. 450ms limit)
++        future = _executor.submit(_run_internal)
++        try:
++            return future.result(timeout=0.45)
++        except concurrent.futures.TimeoutError:
++            logger.error("Confidence Engine: pipeline execution timed out (450ms limit).")
++            return (
++                "REVIEW",
++                0.45,
++                "Failsafe triggered: Verifier system execution timed out (450ms). degraded to manual review.",
++                {"error": "timeout"}
++            )
++        except Exception as e:
++            logger.error(f"Confidence Engine Failsafe: {e}", exc_info=True)
++            return (
++                "REVIEW",
++                0.45,
++                f"Failsafe triggered: Verifier system encountered a processing exception ({type(e).__name__}). degraded to manual review.",
++                {"error": str(e)}
++            )
+diff --git a/backend/tests/test_confidence_engine.py b/backend/tests/test_confidence_engine.py
+new file mode 100644
+index 0000000..6c1e7ed
+--- /dev/null
++++ b/backend/tests/test_confidence_engine.py
+@@ -0,0 +1,269 @@
++import unittest
++import numpy as np
++import cv2
++import app.services.confidence_engine
++from app.services.confidence_engine import ConfidenceEngine, GeometryVerifier, DuplicateVerifier, LocalizationVerifier
++from app.schemas.schemas import LaneConfigBase
++
++class MockAIVerifier:
++    def __init__(self, is_verified=True, yolo_conf=0.8, class_name="hole"):
++        self.is_verified = is_verified
++        self.yolo_conf = yolo_conf
++        self.class_name = class_name
++        self.called_with = None
++
++    def verify_candidate_roi(self, img, cX, cY, diameter_px, *args, **kwargs):
++        self.called_with = (img, cX, cY, diameter_px)
++        return self.is_verified, self.yolo_conf, self.class_name
++
++class TestConfidenceEngine(unittest.TestCase):
++    def setUp(self):
++        self.config = LaneConfigBase()
++        self.mock_ai = MockAIVerifier()
++        app.services.confidence_engine.ai_verifier = self.mock_ai
++
++    def test_geometry_verifier_strong_pass(self):
++        # Strict ranges: circularity >= 0.65, solidity >= 0.80, aspect_ratio between 0.7 and 1.4
++        # Area loose: 15.0 <= area <= 5000.0
++        status, score = GeometryVerifier.evaluate(200.0, 0.8, 0.95, 1.0, self.config)
++        self.assertEqual(status, "strong_pass")
++        self.assertEqual(score, 1.0)
++
++    def test_geometry_verifier_weak_pass(self):
++        # Loose ranges: circularity loose (0.45 <= circ < 0.65), solidity loose (0.65 <= solidity < 0.80),
++        # aspect ratio loose (0.3 <= aspect < 0.7 or 1.4 < aspect <= 3.0)
++        status, score = GeometryVerifier.evaluate(200.0, 0.5, 0.7, 2.0, self.config)
++        self.assertEqual(status, "weak_pass")
++        self.assertEqual(score, 0.5)
++
++    def test_geometry_verifier_fail_out_of_loose(self):
++        # Circularity below loose -> geom_score has 0.0, yields "fail" status
++        status, score = GeometryVerifier.evaluate(200.0, 0.2, 0.95, 1.0, self.config)
++        self.assertEqual(status, "fail")
++        self.assertLess(score, 1.0)
++
++    def test_geometry_verifier_fail_area_out_of_bounds(self):
++        # Area below loose limit (15.0) -> fails even if shape parameters are perfect
++        status, score = GeometryVerifier.evaluate(10.0, 0.8, 0.95, 1.0, self.config)
++        self.assertEqual(status, "fail")
++
++    def test_duplicate_verifier_neutral(self):
++        verified_shots = [
++            {"shot_number": 1, "x_raw": 100.0, "y_raw": 100.0, "created_at_ts": 10.0}
++        ]
++        # Dist is large, so not duplicate
++        status, info = DuplicateVerifier.evaluate(200.0, 200.0, 11.0, verified_shots, self.config)
++        self.assertEqual(status, "neutral")
++        self.assertEqual(info, {})
++
++    def test_duplicate_verifier_duplicate(self):
++        verified_shots = [
++            {"shot_number": 1, "x_raw": 100.0, "y_raw": 100.0, "created_at_ts": 10.0, "id": "shot_1"}
++        ]
++        # Distance within duplicate_radius_px (15.0) and time within duplicate_time_window_sec (5.0)
++        status, info = DuplicateVerifier.evaluate(105.0, 105.0, 12.0, verified_shots, self.config)
++        self.assertEqual(status, "duplicate")
++        self.assertEqual(info["matched_shot_number"], 1)
++        self.assertEqual(info["shot_id"], "shot_1")
++        self.assertLess(info["dist"], 15.0)
++
++    def test_localization_verifier_strong_pass(self):
++        # Create a simple square contour representing a hole
++        c = np.array([[[10, 10]], [[10, 20]], [[20, 20]], [[20, 10]]], dtype=np.int32)
++        # Create a gray image where the ROI area is dark (bullet hole interior)
++        gray_img = np.ones((100, 100), dtype=np.uint8) * 255
++        gray_img[10:21, 10:21] = 50 # Dark hole
++        gray_img[15, 15] = 10 # True intensity peak center
++
++        status, score, info = LocalizationVerifier.evaluate(c, gray_img, self.config)
++        self.assertEqual(status, "strong_pass")
++        self.assertEqual(score, 1.0)
++        self.assertLessEqual(info["spread"], self.config.localization_spread_threshold)
++
++    def test_localization_verifier_fail_spread(self):
++        # Create a contour and a gray image that creates a large mismatch between intensity weighted centroid and normal center
++        c = np.array([[[10, 10]], [[10, 30]], [[30, 30]], [[30, 10]]], dtype=np.int32)
++        gray_img = np.ones((100, 100), dtype=np.uint8) * 255
++        # Put a very dark spot at the extreme bottom right corner of the bounding box
++        gray_img[28:31, 28:31] = 0
++
++        status, score, info = LocalizationVerifier.evaluate(c, gray_img, self.config)
++        self.assertEqual(status, "fail")
++        self.assertEqual(score, 0.2)
++        self.assertGreater(info["spread"], self.config.localization_spread_threshold)
++
++    def test_confidence_engine_duplicate_rejection(self):
++        candidate = {"x_raw": 105.0, "y_raw": 105.0, "area": 100.0, "circularity": 0.8, "solidity": 0.9, "aspect_ratio": 1.0, "diameter_px": 10.0, "raw_contour_np": [[[10,10]]]}
++        verified_shots = [{"shot_number": 1, "x_raw": 100.0, "y_raw": 100.0, "created_at_ts": 10.0, "id": "shot_1"}]
++        gray_img = np.ones((100, 100), dtype=np.uint8) * 255
++
++        verdict, score, explanation, signals = ConfidenceEngine.evaluate_candidate(
++            candidate, verified_shots, self.config, gray_img, timestamp=12.0
++        )
++        self.assertEqual(verdict, "REJECTED")
++        self.assertEqual(score, 0.0)
++        self.assertIn("DuplicateVerifier", explanation)
++        self.assertEqual(signals, {"duplicate": "duplicate"})
++
++    def test_confidence_engine_geometry_rejection(self):
++        # Geometry status is "fail" and s_geom <= 0.15 (very bad geometry)
++        candidate = {"x_raw": 150.0, "y_raw": 150.0, "area": 100.0, "circularity": 0.1, "solidity": 0.1, "aspect_ratio": 5.0, "diameter_px": 10.0, "raw_contour_np": [[[10,10]]]}
++        verified_shots = []
++        gray_img = np.ones((100, 100), dtype=np.uint8) * 255
++
++        verdict, score, explanation, signals = ConfidenceEngine.evaluate_candidate(
++            candidate, verified_shots, self.config, gray_img, timestamp=12.0
++        )
++        self.assertEqual(verdict, "REJECTED")
++        self.assertEqual(score, 0.0)
++        self.assertIn("GeometryVerifier", explanation)
++        self.assertEqual(signals, {"geometry": "fail"})
++
++    def test_confidence_engine_conflict_yolo_strong_cv_fail(self):
++        # YOLO conf >= config.yolo_conf_strict (0.25), but CV geometry and localization consensus failed
++        # Make localization fail by using a spread out gray image
++        c = np.array([[[10, 10]], [[10, 30]], [[30, 30]], [[30, 10]]], dtype=np.int32)
++        candidate = {
++            "x_raw": 150.0, "y_raw": 150.0, 
++            "area": 1000.0, "circularity": 0.2, "solidity": 0.8, "aspect_ratio": 1.0,
++            "diameter_px": 10.0, 
++            "raw_contour_np": c.tolist()
++        }
++        verified_shots = []
++        app.services.confidence_engine.ai_verifier = MockAIVerifier(is_verified=True, yolo_conf=0.9, class_name="hole") # strong YOLO
++        # localization fails
++        gray_img = np.ones((100, 100), dtype=np.uint8) * 255
++        gray_img[28:31, 28:31] = 0
++
++        verdict, score, explanation, signals = ConfidenceEngine.evaluate_candidate(
++            candidate, verified_shots, self.config, gray_img, timestamp=12.0
++        )
++        self.assertEqual(verdict, "CONFLICT")
++        self.assertEqual(score, 0.50)
++        self.assertIn("Active Disagreement", explanation)
++        self.assertEqual(signals["yolo"], 0.9)
++        self.assertEqual(signals["geometry"], "fail")
++        self.assertEqual(signals["localization"], "fail")
++
++    def test_confidence_engine_conflict_cv_strong_yolo_fail(self):
++        # CV shape (GeometryVerifier strong_pass) and localization (LocalizationVerifier strong_pass) are perfect,
++        # but YOLO failed to detect a hole (conf < yolo_conf_loose (0.10))
++        c = np.array([[[10, 10]], [[10, 20]], [[20, 20]], [[20, 10]]], dtype=np.int32)
++        candidate = {
++            "x_raw": 150.0, "y_raw": 150.0, 
++            "area": 200.0, "circularity": 0.8, "solidity": 0.95, "aspect_ratio": 1.0,
++            "diameter_px": 10.0, 
++            "raw_contour_np": c.tolist()
++        }
++        verified_shots = []
++        app.services.confidence_engine.ai_verifier = MockAIVerifier(is_verified=False, yolo_conf=0.05, class_name="false_positive")
++        gray_img = np.ones((100, 100), dtype=np.uint8) * 255
++        gray_img[10:21, 10:21] = 50 # Perfect dark hole
++        gray_img[15, 15] = 10 # True intensity peak center
++
++        verdict, score, explanation, signals = ConfidenceEngine.evaluate_candidate(
++            candidate, verified_shots, self.config, gray_img, timestamp=12.0
++        )
++        self.assertEqual(verdict, "CONFLICT")
++        self.assertEqual(score, 0.50)
++        self.assertIn("Active Disagreement", explanation)
++        self.assertEqual(signals["yolo"], 0.05)
++        self.assertEqual(signals["geometry"], "strong_pass")
++        self.assertEqual(signals["localization"], "strong_pass")
++
++    def test_duplicate_verifier_sqlalchemy_object(self):
++        class MockSQLAShot:
++            def __init__(self, shot_number, x_raw, y_raw, created_at, id):
++                self.shot_number = shot_number
++                self.x_raw = x_raw
++                self.y_raw = y_raw
++                self.created_at = created_at
++                self.id = id
++
++        import datetime
++        dt = datetime.datetime(2026, 7, 4, 12, 0, 0)
++        verified_shots = [MockSQLAShot(1, 100.0, 100.0, dt, "shot_1")]
++        # Distance within duplicate_radius_px (15.0) and time within duplicate_time_window_sec (5.0)
++        status, info = DuplicateVerifier.evaluate(105.0, 105.0, dt.timestamp() + 2.0, verified_shots, self.config)
++        self.assertEqual(status, "duplicate")
++        self.assertEqual(info["matched_shot_number"], 1)
++
++    def test_geometry_verifier_circularity_above_one(self):
++        # Circularity slightly above 1.0 (digital contour artifact) should still pass
++        status, score = GeometryVerifier.evaluate(200.0, 1.05, 0.95, 1.0, self.config)
++        self.assertEqual(status, "strong_pass")
++        self.assertEqual(score, 1.0)
++
++    def test_confidence_engine_area_out_of_bounds_rejection(self):
++        # Candidate shape is perfect but area is outside loose bounds -> REJECTED
++        candidate = {"x_raw": 150.0, "y_raw": 150.0, "area": 10.0, "circularity": 0.8, "solidity": 0.9, "aspect_ratio": 1.0, "diameter_px": 10.0, "raw_contour_np": [[[10,10]]]}
++        verified_shots = []
++        gray_img = np.ones((100, 100), dtype=np.uint8) * 255
++
++        verdict, score, explanation, signals = ConfidenceEngine.evaluate_candidate(
++            candidate, verified_shots, self.config, gray_img, timestamp=12.0
++        )
++        self.assertEqual(verdict, "REJECTED")
++
++    def test_confidence_engine_failsafe_loc_error(self):
++        # YOLO is strong, geometry is weak, localization fails with zero moments (e.g. empty contour)
++        # Should trigger the failsafe block due to empty contour exception (returns REVIEW with 0.45 score)
++        candidate = {
++            "x_raw": 150.0, "y_raw": 150.0,
++            "area": 100.0, "circularity": 0.2, "solidity": 0.8, "aspect_ratio": 1.0,
++            "diameter_px": 10.0,
++            "raw_contour_np": [] # Will cause empty contour ValueError exception
++        }
++        verified_shots = []
++        app.services.confidence_engine.ai_verifier = MockAIVerifier(is_verified=True, yolo_conf=0.9, class_name="hole")
++        gray_img = np.ones((100, 100), dtype=np.uint8) * 255
++
++        verdict, score, explanation, signals = ConfidenceEngine.evaluate_candidate(
++            candidate, verified_shots, self.config, gray_img, timestamp=12.0
++        )
++        self.assertEqual(verdict, "REVIEW")
++        self.assertEqual(score, 0.45)
++        self.assertIn("error", signals)
++
++    def test_confidence_engine_failsafe(self):
++        # Triggers exception in evaluation -> degraded to manual review
++        candidate = None # None will throw TypeError when accessed like candidate["x_raw"]
++        verified_shots = []
++        gray_img = np.ones((100, 100), dtype=np.uint8) * 255
++
++        verdict, score, explanation, signals = ConfidenceEngine.evaluate_candidate(
++            candidate, verified_shots, self.config, gray_img, timestamp=12.0
++        )
++        self.assertEqual(verdict, "REVIEW")
++        self.assertEqual(score, 0.45)
++        self.assertIn("Failsafe triggered", explanation)
++        self.assertIn("error", signals)
++
++    def test_confidence_engine_timeout(self):
++        # Simulate a slow verifier by sleeping inside verify_candidate_roi
++        import time as pytime
++        class SlowAIVerifier:
++            def verify_candidate_roi(self, img, cX, cY, diameter_px, *args, **kwargs):
++                pytime.sleep(0.6) # Exceeds 0.45s timeout
++                return True, 0.9, "hole"
++                
++        app.services.confidence_engine.ai_verifier = SlowAIVerifier()
++        
++        candidate = {
++            "x_raw": 150.0, "y_raw": 150.0,
++            "area": 100.0, "circularity": 0.8, "solidity": 0.9, "aspect_ratio": 1.0,
++            "diameter_px": 10.0,
++            "raw_contour_np": [[[10,10]]]
++        }
++        verified_shots = []
++        gray_img = np.ones((100, 100), dtype=np.uint8) * 255
++        
++        verdict, score, explanation, signals = ConfidenceEngine.evaluate_candidate(
++            candidate, verified_shots, self.config, gray_img, timestamp=12.0
++        )
++        self.assertEqual(verdict, "REVIEW")
++        self.assertEqual(score, 0.45)
++        self.assertIn("timed out", explanation)
++
++if __name__ == '__main__':
++    unittest.main()
